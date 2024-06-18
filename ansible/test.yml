@@ -1,0 +1,26 @@
+---
+- name: Copy and apply Kubernetes manifests
+  hosts: master
+  become: true
+  vars:
+    kubeconfig_path: /etc/kubernetes/admin.conf  # Adjust if your kubeconfig path is different
+  tasks:
+    - name: Get SonarQube service details
+      shell: |
+        export KUBECONFIG={{ kubeconfig_path }}
+        kubectl get svc sonarqube -o json
+      register: sonarqube_svc
+    - name: Get Node IP
+      shell: |
+        export KUBECONFIG={{ kubeconfig_path }}
+        kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'
+      register: node_ip
+
+    - name: Parse SonarQube service details
+      set_fact:
+        sonarqube_nodeport: "{{ sonarqube_svc.stdout | from_json | json_query('spec.ports[0].nodePort') }}"
+        sonarqube_ip: "{{ node_ip.stdout }}"
+
+    - name: Display SonarQube service details
+      debug:
+        msg: "SonarQube is available at http://{{ sonarqube_ip }}:{{ sonarqube_nodeport }}"

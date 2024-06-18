@@ -1,0 +1,317 @@
+---
+- name: Configure Kubernetes APT repository and install Kubernetes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Update apt package cache
+      become: yes
+      apt:
+        update_cache: yes
+      register: update_result
+      until: update_result is succeeded
+    - name: Install required packages
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - docker.io
+        - apt-transport-https
+        - curl
+        - gnupg-agent
+      register: install_result
+      until: install_result is succeeded
+    - name: Ensure /etc/apt/keyrings directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Kubernetes GPG key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        dest: /tmp/kubernetes-release.key
+        mode: '0644'
+
+    - name: Import Kubernetes GPG key
+      command: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes-release.key
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Clean up temporary key file
+      file:
+        path: /tmp/kubernetes-release.key
+        state: absent
+
+    - name: Ensure /etc/apt/sources.list.d directory exists
+      file:
+        path: /etc/apt/sources.list.d
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes APT repository to sources list
+      lineinfile:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        line: 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /'
+        create: yes
+        state: present
+        mode: '0644'
+
+    - name: Update APT package index
+      become: yes
+      apt:
+        update_cache: yes
+      register: update_result
+      until: update_result is succeeded
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+          - python3-jmespath
+        state: present
+        update_cache: yes
+      register: update_result
+      until: update_result is succeeded
+    - name: Hold Kubernetes packages
+      command: sudo apt-mark hold kubelet kubeadm kubectl
+
+    - name: Disable swap
+      command: swapoff -a
+      become: yes
+    - name: Ensure swap is commented out in /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*swap.*)$'
+        replace: '# \1'
+
+- name: Clean up Kubernetes configuration on master
+  hosts: master
+  become: yes
+  tasks:
+    - name: Remove existing Kubernetes manifests
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /etc/kubernetes/manifests/kube-apiserver.yaml
+        - /etc/kubernetes/manifests/kube-controller-manager.yaml
+        - /etc/kubernetes/manifests/kube-scheduler.yaml
+        - /etc/kubernetes/manifests/etcd.yaml
+
+    - name: Reset kubeadm configuration
+      command: kubeadm reset -f
+      ignore_errors: yes
+    - name: Remove etcd data directory
+      file:
+        path: /var/lib/etcd
+        state: absent
+      ignore_errors: yes
+    - name: Ensure containerd service is running
+      service:
+        name: "{{ item }}"
+        state: started
+      loop:
+        - docker
+        - containerd
+      ignore_errors: true
+
+    - name: Load br_netfilter module
+      ansible.builtin.shell: modprobe br_netfilter
+
+    - name: Ensure br_netfilter module is loaded
+      ansible.builtin.shell: lsmod | grep br_netfilter
+      register: br_netfilter_loaded
+      failed_when: br_netfilter_loaded.rc != 0
+      changed_when: false
+
+    - name: Load ip_tables module
+      ansible.builtin.shell: modprobe ip_tables
+
+    - name: Ensure ip_tables module is loaded
+      ansible.builtin.shell: lsmod | grep ip_tables
+      register: ip_tables_loaded
+      failed_when: ip_tables_loaded.rc != 0
+      changed_when: false
+
+    - name: Load necessary kernel modules
+      ansible.builtin.shell: |
+        modprobe br_netfilter
+        modprobe ip_tables
+
+    - name: Ensure br_netfilter is configured
+      ansible.builtin.shell: echo '1' > /proc/sys/net/bridge/bridge-nf-call-iptables
+
+    - name: Ensure IPv4 forwarding is enabled
+      ansible.builtin.shell: echo '1' > /proc/sys/net/ipv4/ip_forward
+
+    - name: Persist net.bridge.bridge-nf-call-iptables setting
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        line: 'net.bridge.bridge-nf-call-iptables = 1'
+        create: yes
+
+    - name: Persist net.ipv4.ip_forward setting
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        line: 'net.ipv4.ip_forward = 1'
+        create: yes
+
+    - name: Reload sysctl settings
+      ansible.builtin.command: sysctl -p
+- name: Initialize Kubernetes Master
+  hosts: master
+  become: yes
+  tasks:
+    - name: Initialize the Kubernetes cluster
+      command: sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+      register: kubeadm_init
+
+    - name: Create .kube directory
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        mode: '0755'
+
+    - name: Copy kubeconfig to user directory
+      command: cp /etc/kubernetes/admin.conf /home/{{ ansible_user }}/.kube/config
+      become: yes
+      become_user: root
+
+    - name: Set kubeconfig ownership
+      file:
+        path: /home/{{ ansible_user }}/.kube/config
+        mode: '0644'
+    - name: Copy calico.yaml to target nodes
+      copy:
+        src: calico.yaml
+        dest: /tmp/calico.yaml
+    - name: Apply Calico Network Plugin
+      command: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+      become: yes
+      become_method: sudo
+      become_user: test
+      
+    - name: Ensure /tmp/admin.conf exists on master
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf_exists
+
+    - name: Fail if admin.conf does not exist
+      fail:
+        msg: "The admin.conf file does not exist on the master node."
+      when: not admin_conf_exists.stat.exists
+
+    - name: Copy admin.conf to control node
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: /tmp/admin.conf
+        flat: yes
+- name: Join Worker Nodes to the Kubernetes Cluster
+  hosts: workers
+  become: yes
+  tags:
+    - join_worker_nodes
+  tasks:
+    - name: Create .kube directory
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0755'
+    - name: Copy admin.conf from control node to worker node
+      copy:
+        src: /tmp/admin.conf
+        dest: /root/.kube/config
+        mode: '0644'
+    - name: Set KUBECONFIG environment variable for test user
+      become_user: test
+      lineinfile:
+        path: "/home/test/.bashrc"
+        line: 'export KUBECONFIG=/home/test/.kube/config'
+        create: yes
+    - name: Retrieve join command
+      shell: kubeadm token create --print-join-command
+        #delegate_to: master
+      register: join_command
+      run_once: true
+
+    - name: Join the node to the cluster
+      command: "{{ join_command.stdout }}"
+
+- name: Installing sonarqube Application
+  hosts: master
+  become: yes
+  tags:
+    - sonarqube
+  tasks:
+    - name: Check if all worker nodes are ready
+      shell: |
+        ready_nodes=$(kubectl get nodes --no-headers | grep -v master | awk '{print $2}' | grep -c 'Ready')
+        total_nodes=$(kubectl get nodes --no-headers | grep -v master | wc -l)
+        echo $((total_nodes - ready_nodes))
+      register: not_ready_nodes
+      retries: 30  # Adjust the retries as per your requirement
+      delay: 10  # Wait 10 seconds between retries
+      until: not_ready_nodes.stdout == "0"
+      changed_when: false
+      failed_when: not_ready_nodes.rc != 0 or not_ready_nodes.stdout == ""
+      ignore_errors: true
+
+    - name: Fail if not all nodes are ready after retries
+      fail:
+        msg: "Not all worker nodes are ready."
+      when: not_ready_nodes.stdout != "0"
+
+    - name: Copy Postgres database yaml file
+      copy:
+        src: postgres.yaml
+        dest: /root/postgres.yaml
+      become: true
+      become_user: root
+    - name: Copy Sonarqube application yaml file
+      copy:
+        src: sonarqube.yaml
+        dest: /root/sonarqube.yaml
+      become: true
+      become_user: root
+    - name: Proceed with further tasks after all nodes are ready
+      debug:
+        msg: "All worker nodes are ready. Proceeding with further tasks..."
+    - name: Install SonarQube App
+      shell: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf 
+        kubectl apply -f ~/postgres.yaml --validate=false
+        kubectl apply -f ~/sonarqube.yaml --validate=false
+      become: true
+    - name: Checking Sonarqube ready status
+      shell: |
+        ready_pods=$(kubectl get pods --no-headers | awk '{print $3}' | grep -c 'Running')
+        total_pods=$(kubectl get pods --no-headers | wc -l)
+        echo $((total_pods - ready_pods))
+      register: not_ready_pods
+      retries: 2  # Adjust the retries as per your requirement
+      delay: 5  # Wait 10 seconds between retries
+      until: not_ready_pods.stdout == "0"
+      changed_when: false
+      failed_when: not_ready_pods.rc != 0 or not_ready_pods.stdout == ""
+      ignore_errors: true
+    - name: Get SonarQube service details
+      shell: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        kubectl get svc sonarqube -o json
+      register: sonarqube_svc
+    - name: Get Node IP
+      shell: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'
+      register: node_ip
+
+    - name: Parse SonarQube service details
+      set_fact:
+        sonarqube_nodeport: "{{ sonarqube_svc.stdout | from_json | json_query('spec.ports[0].nodePort') }}"
+        sonarqube_ip: "{{ node_ip.stdout }}"
+
+    - name: Display SonarQube service details
+      debug:
+        msg: "SonarQube is available at http://{{ sonarqube_ip }}:{{ sonarqube_nodeport }}"
