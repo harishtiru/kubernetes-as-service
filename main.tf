@@ -4,6 +4,10 @@ terraform {
       source  = "hashicorp/vsphere"
       version = ">= 2.0.0"
     }
+    template = {
+      source = "hashicorp/template"
+      version = ">= 2.0.0"
+    }
   }
 }
 variable "host_datastore_map" {
