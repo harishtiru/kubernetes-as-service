@@ -75,4 +75,8 @@ variable "idrsa" {
   description = "id_rsa key file"
   type        = string
 }
+variable "idrsa_pub" {
+  description = "id_rsa key file"
+  type        = string
+}
 
