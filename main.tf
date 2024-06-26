@@ -90,12 +90,14 @@ resource "vsphere_tag" "master" {
   name        = "master"
   description = "Tag for master VMs"
   category_id = vsphere_tag_category.category.id
+  category_id = coalesce(data.vsphere_tag_category.existing_category.id, vsphere_tag_category.category.id)
 }
 
 resource "vsphere_tag" "worker" {
   name        = "worker"
   description = "Tag for worker VMs"
   category_id = vsphere_tag_category.category.id
+  category_id = coalesce(data.vsphere_tag_category.existing_category.id, vsphere_tag_category.category.id)
 }
 
 resource "vsphere_virtual_machine" "vms" {
