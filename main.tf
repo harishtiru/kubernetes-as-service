@@ -14,9 +14,8 @@ variable "host_datastore_map" {
   type = map(list(string))
   description = "Map of hosts to their accessible datastores"
   default = {
-    "172.28.8.2" = ["Local-2.1"],
-    "172.28.8.3" = ["Local-3.0"],
-    "172.28.8.4" = ["Local-4.0"]
+    "172.16.165.5" = ["storage-1"],
+    "172.16.165.6" = ["storage-2"]
   }
 }
 provider "vsphere" {
